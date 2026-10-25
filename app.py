@@ -77,15 +77,8 @@ with st.sidebar:
     )
     st.session_state["api_provider"] = provider
 
-    # Model selector based on provider
-    if provider == PROVIDER_GEMINI:
-        model_name = st.selectbox("Gemini Model", GEMINI_MODELS, index=0)
-        api_key_env = os.getenv("GEMINI_API_KEY", "")
-    else:
-        model_name = st.selectbox("Groq Model", GROQ_MODELS, index=0)
-        api_key_env = os.getenv("GROQ_API_KEY", "")
-
     # Secure API Key Input
+    api_key_env = os.getenv("GEMINI_API_KEY" if provider == PROVIDER_GEMINI else "GROQ_API_KEY", "")
     user_api_key = st.text_input(
         f"{provider} API Key",
         value=st.session_state["api_key"] if st.session_state["api_key"] else api_key_env,
@@ -94,6 +87,14 @@ with st.sidebar:
         help="Keys are stored exclusively in temporary session memory and are never written to disk or printed."
     )
     st.session_state["api_key"] = user_api_key.strip()
+
+    # Model selector based on provider
+    if provider == PROVIDER_GEMINI:
+        from services.ai_service import get_available_gemini_models
+        active_models = get_available_gemini_models(st.session_state["api_key"])
+        model_name = st.selectbox("Gemini Model", active_models, index=0)
+    else:
+        model_name = st.selectbox("Groq Model", GROQ_MODELS, index=0)
 
     # Engine Status Indicator
     if st.session_state["api_key"]:

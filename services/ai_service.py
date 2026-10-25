@@ -1,7 +1,8 @@
 """
 Multimodal AI Service
 Provides unified multimodal vision & text generation across Google Gemini 1.5/2.0
-and Groq Vision/LLM models, with bulletproof structured JSON validation and demo fallback.
+and Groq Vision/LLM models, with bulletproof structured JSON validation,
+dynamic ModelService discovery, and demo fallback.
 """
 
 import json
@@ -61,6 +62,107 @@ def _pil_to_base64_data_uri(image: Image.Image) -> str:
     return f"data:image/jpeg;base64,{img_b64}"
 
 
+def get_available_gemini_models(api_key: str) -> List[str]:
+    """Dynamically queries Google Gemini ModelService for all models available to this API key."""
+    if not api_key or not api_key.strip():
+        return GEMINI_MODELS
+    try:
+        import google.generativeai as genai
+        genai.configure(api_key=api_key.strip())
+        supported = []
+        for m in genai.list_models():
+            if hasattr(m, "supported_generation_methods") and "generateContent" in m.supported_generation_methods:
+                clean_name = m.name.replace("models/", "")
+                supported.append(clean_name)
+        if supported:
+            def model_sort_key(name):
+                n = name.lower()
+                if "1.5-flash" in n:
+                    return (0, n)
+                if "flash" in n:
+                    return (1, n)
+                if "1.5-pro" in n:
+                    return (2, n)
+                if "pro" in n:
+                    return (3, n)
+                return (4, n)
+            supported.sort(key=model_sort_key)
+            return supported
+    except Exception:
+        pass
+    return GEMINI_MODELS
+
+
+def call_gemini_multimodal(api_key: str, requested_model: Optional[str], contents: list) -> str:
+    """
+    Executes a multimodal Gemini generation request with intelligent model name resolution
+    and automatic candidate fallback to prevent 404 / unsupported model errors.
+    """
+    import google.generativeai as genai
+    genai.configure(api_key=api_key.strip())
+
+    req = (requested_model or "gemini-1.5-flash-latest").replace("models/", "").strip()
+    
+    # 1. Build initial candidate list
+    candidates = [req]
+    for alias in [
+        f"{req}-latest",
+        f"{req}-002",
+        f"{req}-001",
+        "gemini-1.5-flash-latest",
+        "gemini-1.5-flash-002",
+        "gemini-1.5-flash-001",
+        "gemini-1.5-flash",
+        "gemini-2.0-flash",
+        "gemini-2.0-flash-exp",
+        "gemini-2.5-flash",
+        "gemini-1.5-pro-latest",
+        "gemini-1.5-pro"
+    ]:
+        if alias not in candidates:
+            candidates.append(alias)
+
+    # 2. Try dynamically querying list_models from the active API key
+    try:
+        discovered = [
+            m.name.replace("models/", "")
+            for m in genai.list_models()
+            if hasattr(m, "supported_generation_methods") and "generateContent" in m.supported_generation_methods
+        ]
+        if discovered:
+            # Place discovered models at high priority
+            for d in reversed(discovered):
+                if d in candidates:
+                    candidates.remove(d)
+                candidates.insert(1, d)
+    except Exception:
+        pass
+
+    # 3. Attempt calling candidates sequentially
+    last_error = None
+    for model_id in candidates:
+        try:
+            model = genai.GenerativeModel(model_id)
+            response = model.generate_content(contents)
+            if response and response.text:
+                return response.text
+        except Exception as e:
+            err_msg = str(e)
+            last_error = e
+            # Only continue fallback on 404 / not found / not supported for generateContent
+            if ("404" in err_msg or 
+                "not found" in err_msg.lower() or 
+                "not supported for generatecontent" in err_msg.lower() or
+                "is not found" in err_msg.lower()):
+                continue
+            # For bad auth / quota / rate limit, don't waste time cycling all models
+            raise e
+
+    if last_error:
+        raise last_error
+    raise RuntimeError(f"Could not generate content with model '{requested_model}' or any available fallback.")
+
+
 # =====================================================================
 # 1. Food Recognition and Nutrition Audit
 # =====================================================================
@@ -101,12 +203,8 @@ def analyze_food_image(
 
     try:
         if provider == PROVIDER_GEMINI:
-            import google.generativeai as genai
-            genai.configure(api_key=api_key)
-            model_id = model_name or "gemini-1.5-flash"
-            model = genai.GenerativeModel(model_id)
-            response = model.generate_content([prompt, image])
-            data = _clean_json_response(response.text)
+            raw_text = call_gemini_multimodal(api_key, model_name, [prompt, image])
+            data = _clean_json_response(raw_text)
             data["is_demo"] = False
             return data
 
@@ -191,12 +289,8 @@ def analyze_food_freshness(
 
     try:
         if provider == PROVIDER_GEMINI:
-            import google.generativeai as genai
-            genai.configure(api_key=api_key)
-            model_id = model_name or "gemini-1.5-flash"
-            model = genai.GenerativeModel(model_id)
-            response = model.generate_content([prompt, image])
-            data = _clean_json_response(response.text)
+            raw_text = call_gemini_multimodal(api_key, model_name, [prompt, image])
+            data = _clean_json_response(raw_text)
             data["is_demo"] = False
             return data
 
@@ -289,14 +383,9 @@ def analyze_kitchen_hygiene(
 
     try:
         if provider == PROVIDER_GEMINI:
-            import google.generativeai as genai
-            genai.configure(api_key=api_key)
-            model_id = model_name or "gemini-1.5-flash"
-            model = genai.GenerativeModel(model_id)
-            # Pass prompt followed by all images (multimodal multi-frame)
             contents = [prompt] + images[:4]
-            response = model.generate_content(contents)
-            data = _clean_json_response(response.text)
+            raw_text = call_gemini_multimodal(api_key, model_name, contents)
+            data = _clean_json_response(raw_text)
             data["is_demo"] = False
             return data
 
@@ -304,7 +393,6 @@ def analyze_kitchen_hygiene(
             from groq import Groq
             client = Groq(api_key=api_key)
             model_id = model_name or "llama-3.2-11b-vision-preview"
-            # Groq vision supports primary frame
             primary_img = images[0]
             data_uri = _pil_to_base64_data_uri(primary_img)
             completion = client.chat.completions.create(
@@ -386,12 +474,8 @@ def generate_smart_recipes(
 
     try:
         if provider == PROVIDER_GEMINI:
-            import google.generativeai as genai
-            genai.configure(api_key=api_key)
-            model_id = model_name or "gemini-1.5-flash"
-            model = genai.GenerativeModel(model_id)
-            response = model.generate_content(prompt)
-            data = _clean_json_response(response.text)
+            raw_text = call_gemini_multimodal(api_key, model_name, [prompt])
+            data = _clean_json_response(raw_text)
             if isinstance(data, dict) and "recipes" in data:
                 data = data["recipes"]
             for r in data:
@@ -489,12 +573,8 @@ def generate_personalized_meal_plan(
 
     try:
         if provider == PROVIDER_GEMINI:
-            import google.generativeai as genai
-            genai.configure(api_key=api_key)
-            model_id = model_name or "gemini-1.5-flash"
-            model = genai.GenerativeModel(model_id)
-            response = model.generate_content(prompt)
-            data = _clean_json_response(response.text)
+            raw_text = call_gemini_multimodal(api_key, model_name, [prompt])
+            data = _clean_json_response(raw_text)
             data["is_demo"] = False
             return data
 
