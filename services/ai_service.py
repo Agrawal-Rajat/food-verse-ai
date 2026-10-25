@@ -62,84 +62,124 @@ def _pil_to_base64_data_uri(image: Image.Image) -> str:
     return f"data:image/jpeg;base64,{img_b64}"
 
 
+NON_VISION_PATTERNS = [
+    "tts", "audio", "embed", "imagen", "whisper", "speech", "bison", "learnlm", "robotics"
+]
+
+
+def is_valid_multimodal_model(name: str) -> bool:
+    """Checks if a model is capable of multimodal vision (not TTS, embedding, or audio only)."""
+    nl = name.lower()
+    for pat in NON_VISION_PATTERNS:
+        if pat in nl:
+            return False
+    return True
+
+
 def get_available_gemini_models(api_key: str) -> List[str]:
-    """Dynamically queries Google Gemini ModelService for all models available to this API key."""
+    """Dynamically queries Google Gemini ModelService for multimodal vision-capable models."""
     if not api_key or not api_key.strip():
-        return GEMINI_MODELS
+        return [m for m in GEMINI_MODELS if is_valid_multimodal_model(m)]
+    
+    discovered_models = []
     try:
         import google.generativeai as genai
         genai.configure(api_key=api_key.strip())
-        supported = []
         for m in genai.list_models():
             if hasattr(m, "supported_generation_methods") and "generateContent" in m.supported_generation_methods:
-                clean_name = m.name.replace("models/", "")
-                supported.append(clean_name)
-        if supported:
-            def model_sort_key(name):
-                n = name.lower()
-                if "1.5-flash" in n:
-                    return (0, n)
-                if "flash" in n:
-                    return (1, n)
-                if "1.5-pro" in n:
-                    return (2, n)
-                if "pro" in n:
-                    return (3, n)
-                return (4, n)
-            supported.sort(key=model_sort_key)
-            return supported
+                clean_name = m.name.replace("models/", "").strip()
+                if is_valid_multimodal_model(clean_name):
+                    discovered_models.append(clean_name)
     except Exception:
         pass
-    return GEMINI_MODELS
+
+    if discovered_models:
+        def vision_priority(name: str):
+            n = name.lower()
+            if "2.0-flash" in n:
+                return (0, n)
+            if "1.5-flash-latest" in n:
+                return (1, n)
+            if "1.5-flash-002" in n:
+                return (2, n)
+            if "1.5-flash" in n:
+                return (3, n)
+            if "1.5-pro-latest" in n:
+                return (4, n)
+            if "1.5-pro" in n:
+                return (5, n)
+            if "2.5-flash" in n:
+                return (6, n)
+            return (7, n)
+
+        # Deduplicate while preserving order
+        deduped = list(dict.fromkeys(discovered_models))
+        deduped.sort(key=vision_priority)
+        return deduped
+
+    return [m for m in GEMINI_MODELS if is_valid_multimodal_model(m)]
 
 
 def call_gemini_multimodal(api_key: str, requested_model: Optional[str], contents: list) -> str:
     """
-    Executes a multimodal Gemini generation request with intelligent model name resolution
-    and automatic candidate fallback to prevent 404 / unsupported model errors.
+    Executes a multimodal Gemini generation request with intelligent model name resolution,
+    strict exclusion of non-vision/TTS models, and automatic fallback.
     """
-    import google.generativeai as genai
-    genai.configure(api_key=api_key.strip())
+    clean_api_key = api_key.strip()
+    has_image = any(isinstance(c, Image.Image) or isinstance(c, (bytes, bytearray)) for c in contents)
 
-    req = (requested_model or "gemini-1.5-flash-latest").replace("models/", "").strip()
-    
+    req = (requested_model or "gemini-2.0-flash").replace("models/", "").strip()
+
     # 1. Build initial candidate list
-    candidates = [req]
+    raw_candidates = [req]
     for alias in [
         f"{req}-latest",
         f"{req}-002",
         f"{req}-001",
+        "gemini-2.0-flash",
         "gemini-1.5-flash-latest",
         "gemini-1.5-flash-002",
         "gemini-1.5-flash-001",
         "gemini-1.5-flash",
-        "gemini-2.0-flash",
-        "gemini-2.0-flash-exp",
-        "gemini-2.5-flash",
         "gemini-1.5-pro-latest",
-        "gemini-1.5-pro"
+        "gemini-1.5-pro",
+        "gemini-2.5-flash"
     ]:
-        if alias not in candidates:
-            candidates.append(alias)
+        if alias not in raw_candidates:
+            raw_candidates.append(alias)
 
-    # 2. Try dynamically querying list_models from the active API key
+    # 2. Query ModelService for verified models
     try:
+        import google.generativeai as genai
+        genai.configure(api_key=clean_api_key)
         discovered = [
-            m.name.replace("models/", "")
+            m.name.replace("models/", "").strip()
             for m in genai.list_models()
             if hasattr(m, "supported_generation_methods") and "generateContent" in m.supported_generation_methods
         ]
         if discovered:
-            # Place discovered models at high priority
             for d in reversed(discovered):
-                if d in candidates:
-                    candidates.remove(d)
-                candidates.insert(1, d)
+                if d in raw_candidates:
+                    raw_candidates.remove(d)
+                raw_candidates.insert(1, d)
     except Exception:
         pass
 
-    # 3. Attempt calling candidates sequentially
+    # 3. Filter candidates: if request includes an image, strictly reject non-vision/TTS models
+    if has_image:
+        candidates = [c for c in raw_candidates if is_valid_multimodal_model(c)]
+    else:
+        candidates = raw_candidates
+
+    if not candidates:
+        candidates = ["gemini-2.0-flash", "gemini-1.5-flash-latest", "gemini-1.5-flash", "gemini-1.5-pro"]
+
     last_error = None
+
+    # 4. Attempt candidates sequentially with google.generativeai
+    import google.generativeai as genai
+    genai.configure(api_key=clean_api_key)
+
     for model_id in candidates:
         try:
             model = genai.GenerativeModel(model_id)
@@ -147,16 +187,48 @@ def call_gemini_multimodal(api_key: str, requested_model: Optional[str], content
             if response and response.text:
                 return response.text
         except Exception as e:
-            err_msg = str(e)
+            err_msg = str(e).lower()
             last_error = e
-            # Only continue fallback on 404 / not found / not supported for generateContent
-            if ("404" in err_msg or 
-                "not found" in err_msg.lower() or 
-                "not supported for generatecontent" in err_msg.lower() or
-                "is not found" in err_msg.lower()):
+
+            # Check if this error indicates an unsupported model or modality
+            is_skippable = (
+                "404" in err_msg or
+                "not found" in err_msg or
+                "not supported for generatecontent" in err_msg or
+                "is not found" in err_msg or
+                "modality is not enabled" in err_msg or
+                "image input modality" in err_msg or
+                "invalid model" in err_msg
+            )
+            if is_skippable:
                 continue
-            # For bad auth / quota / rate limit, don't waste time cycling all models
+
+            # Check if the new google-genai SDK can succeed
+            try:
+                from google import genai as new_genai
+                client = new_genai.Client(api_key=clean_api_key)
+                new_resp = client.models.generate_content(model=model_id, contents=contents)
+                if new_resp and new_resp.text:
+                    return new_resp.text
+            except Exception:
+                pass
+
+            # If it's a critical auth or quota error, re-raise immediately
             raise e
+
+    # 5. Final attempt with new google-genai SDK using primary models
+    try:
+        from google import genai as new_genai
+        client = new_genai.Client(api_key=clean_api_key)
+        for m_id in ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro"]:
+            try:
+                new_resp = client.models.generate_content(model=m_id, contents=contents)
+                if new_resp and new_resp.text:
+                    return new_resp.text
+            except Exception:
+                continue
+    except Exception:
+        pass
 
     if last_error:
         raise last_error
